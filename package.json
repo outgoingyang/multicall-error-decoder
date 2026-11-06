@@ -1,0 +1,79 @@
+{
+  "name": "multicall-error-decoder",
+  "version": "0.1.0",
+  "description": "Multicall batching with per-call revert decoding, waitForTransaction with timeout and replacement handling, a custom error & revert reason decoder for ethers v6 and viem, and RPC fallback providers with liveliness checks.",
+  "keywords": [
+    "ethers",
+    "viem",
+    "multicall",
+    "ethers multicall",
+    "viem multicall",
+    "batch call",
+    "error decoder",
+    "decode error",
+    "decode revert",
+    "decode revert reason",
+    "decode custom error",
+    "custom error decode",
+    "revert reason decoder",
+    "parse revert data",
+    "ethers error handling",
+    "viem error handling",
+    "waitForTransaction",
+    "wait for transaction",
+    "transaction helper",
+    "transaction receipt error",
+    "simulate transaction error",
+    "call exception decode",
+    "ethers CALL_EXCEPTION",
+    "fallback provider",
+    "rpc fallback",
+    "revert"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./error-decoder": {
+      "types": "./dist/error-decoder/index.d.ts",
+      "import": "./dist/error-decoder/index.js"
+    },
+    "./multicall": {
+      "types": "./dist/multicall/index.d.ts",
+      "import": "./dist/multicall/index.js"
+    },
+    "./transaction": {
+      "types": "./dist/transaction/index.d.ts",
+      "import": "./dist/transaction/index.js"
+    },
+    "./provider": {
+      "types": "./dist/provider/index.d.ts",
+      "import": "./dist/provider/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke.mjs && node scripts/smoke2.mjs && node scripts/smoke3.mjs"
+  },
+  "peerDependencies": {
+    "ethers": "^6.13.0",
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "ethers": "^6.13.4",
+    "typescript": "^5.6.3",
+    "viem": "^2.21.0",
+    "vitest": "^5.1.0"
+  }
+}

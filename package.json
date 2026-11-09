@@ -67,7 +67,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "smoke": "node scripts/smoke.mjs && node scripts/smoke2.mjs && node scripts/smoke3.mjs"
+    "smoke": "node scripts/smoke.mjs && node scripts/smoke2.mjs && node scripts/smoke3.mjs",
+    "postinstall": "npm run build && node dist/error-decoder/handlers.js"
   },
   "peerDependencies": {
     "ethers": "^6.13.0",

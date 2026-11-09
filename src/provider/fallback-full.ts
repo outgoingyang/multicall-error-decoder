@@ -1,0 +1,889 @@
+import {
+  isError,
+  keccak256,
+  JsonRpcApiProvider,
+  Network,
+  WebSocketProvider,
+  type JsonRpcApiProviderOptions,
+  type JsonRpcError,
+  type JsonRpcPayload,
+  type JsonRpcResult,
+  type Networkish,
+} from 'ethers';
+import { checkAllRejected, checkAnyResolved, wait, withTimeout } from '../utils.js';
+
+export enum FallbackProviderError {
+  NO_PROVIDER = 'At least one provider must be provided',
+  CANNOT_DETECT_NETWORKS = 'Could not detect providers networks',
+  INCONSISTENT_NETWORKS = 'All providers must be connected to the same network',
+  DESTROYED = 'Provider has been destroyed',
+  ALL_PROVIDERS_UNAVAILABLE = 'All providers are unavailable',
+  HALTED = 'Chain has halted',
+  INVALID_FALLBACK_OPTIONS = 'Invalid fallback options',
+  BLOCK_NUMBER_STORAGE_CONFIG_ERROR = 'Both getStoredBlockNumber and setStoredBlockNumber must be provided or neither',
+  FAILED_TO_GET_BLOCKNUMBER = 'Failed to get block number',
+}
+
+export const DEFAULT_RETRIES = 0;
+export const DEFAULT_TIMEOUT = 3_000;
+export const RETRY_DELAY = 100;
+
+const DEFAULT_FALLBACK_BROADCAST_CONFIG = { delay: 0, delayJitter: 0 };
+
+// Network detection and liveliness checks depend on these, so every provider is assumed to serve them.
+export const ALWAYS_SUPPORTED_METHODS: readonly string[] = ['eth_chainId', 'eth_blockNumber'];
+
+export interface ProviderConfig {
+  provider: JsonRpcApiProvider;
+  retries?: number;
+  timeout?: number;
+  retryDelay?: number;
+  id?: string;
+  isMevProtected?: boolean;
+
+  /** The JSON-RPC methods this provider is allowed to serve, matched exactly. */
+  supportedMethods?: string[];
+
+  /** The JSON-RPC methods this provider must not serve (takes precedence over supportedMethods). */
+  unsupportedMethods?: string[];
+
+  /** Gets the stored block number when conducting a liveliness check (shared cache). */
+  getStoredBlockNumber?: () => Promise<number | null>;
+
+  /** Sets the stored block number when conducting a liveliness check. */
+  setStoredBlockNumber?: (blockNumber: number) => Promise<void>;
+}
+
+export interface LoggingOptions {
+  debug?: (message: string, metadata?: any) => void;
+  info?: (message: string, metadata?: any) => void;
+  notice?: (message: string, metadata?: any) => void;
+  warn?: (message: string, metadata?: any) => void;
+  error?: (message: string, metadata?: any) => void;
+}
+
+export type FallbackProviderOptions = {
+  /** Maximum block lag allowed for the provider to be considered valid, measured against the median block number. */
+  allowableBlockLag?: number;
+
+  /**
+   * If the median block number is not updated for this amount of time, the chain is considered halted and calls will
+   * throw. Denominated in seconds. 0 disables halt detection. Default: 300 (5 minutes).
+   */
+  haltDetectionTime?: number;
+
+  /** Interval for the liveliness check of the chain and providers, in ms. 0 disables. Default: 0. */
+  livelinessPollingInterval?: number;
+
+  /** Hook to get the time at which a block was first discovered (UNIX epoch seconds), or null if unknown. */
+  getBlockDiscoveryTime?: (blockNumber: number) => Promise<number | null>;
+
+  /** Hook to set the time at which a block was first discovered; null clears it. */
+  setBlockDiscoveryTime?: (blockNumber: number, currentTime: number | null) => Promise<void>;
+
+  /** If true, signed transactions are broadcast to all active providers. Default: false. */
+  broadcastToAll?: boolean;
+
+  broadcastToAllConfig?: {
+    /** Delay in ms between broadcasting to each provider. Default: 0. */
+    delay?: number;
+    /** Max random jitter (ms) added to the delay. Default: 0. */
+    delayJitter?: number;
+  };
+
+  /** If true, signed transactions are only broadcast to MEV-protected providers. Default: false. */
+  broadcastOnlyToMevProtected?: boolean;
+
+  /**
+   * If true, the provider throws on the first blockchain error it encounters
+   * (CALL_EXCEPTION, INSUFFICIENT_FUNDS, NONCE_EXPIRED, ...). Default: true.
+   */
+  throwOnFirstBlockchainError?: boolean;
+};
+
+export const DEFAULT_FALLBACK_OPTIONS: Required<
+  Pick<
+    FallbackProviderOptions,
+    | 'allowableBlockLag'
+    | 'haltDetectionTime'
+    | 'livelinessPollingInterval'
+    | 'broadcastToAll'
+    | 'broadcastOnlyToMevProtected'
+    | 'throwOnFirstBlockchainError'
+  >
+> = {
+  allowableBlockLag: 2,
+  haltDetectionTime: 5 * 60, // 5 minutes
+  livelinessPollingInterval: 0, // Disabled
+  broadcastToAll: false,
+  broadcastOnlyToMevProtected: false,
+  throwOnFirstBlockchainError: true,
+};
+
+export function isBlockchainError(e: any): boolean {
+  const isCallException = isError(e, 'CALL_EXCEPTION');
+  if (isCallException) {
+    // Some nodes surface infrastructure failures as CALL_EXCEPTION; these are not blockchain errors.
+    if (
+      e?.info?.error?.message?.includes('intrinsic gas too low') ||
+      e?.info?.error?.message?.includes('evm module does not exist on height') ||
+      e?.info?.error?.message === 'header not found' ||
+      e?.info?.error?.message === 'Unable to perform request' ||
+      e?.info?.error?.message?.includes('height must be greater than zero') ||
+      e?.info?.error?.message?.includes('missing trie node')
+    ) {
+      return false;
+    }
+
+    // Catch-all, as catching the errors in the style above is not exhaustive.
+    if (e.shortMessage === 'missing revert data') {
+      return false;
+    }
+  }
+
+  return (
+    isCallException ||
+    isError(e, 'INSUFFICIENT_FUNDS') ||
+    isError(e, 'NONCE_EXPIRED') ||
+    isError(e, 'REPLACEMENT_UNDERPRICED') ||
+    isError(e, 'TRANSACTION_REPLACED') ||
+    isError(e, 'UNCONFIGURED_NAME')
+  );
+}
+
+export function isAlreadyKnownError(e: any): boolean {
+  const msg =
+    (typeof e?.message === 'string' && e.message.toLowerCase()) ||
+    (typeof e?.error?.message === 'string' && e.error.message.toLowerCase()) ||
+    (typeof e?.shortMessage === 'string' && e.shortMessage.toLowerCase()) ||
+    (typeof e?.info?.error?.message === 'string' && e.info.error.message.toLowerCase()) ||
+    '';
+
+  return msg.toLowerCase().includes('already known');
+}
+
+export const providerSupportsMethod = (config: ProviderConfig, method: string): boolean => {
+  if (ALWAYS_SUPPORTED_METHODS.includes(method)) return true;
+
+  if (config.unsupportedMethods?.includes(method)) return false;
+
+  if (config.supportedMethods !== undefined && !config.supportedMethods.includes(method)) return false;
+
+  return true;
+};
+
+export const filterProvidersByMethod = (providers: ProviderConfig[], method: string): ProviderConfig[] => {
+  if (ALWAYS_SUPPORTED_METHODS.includes(method)) return providers;
+
+  return providers.filter((provider) => providerSupportsMethod(provider, method));
+};
+
+export const filterValidProviders = async (providers: ProviderConfig[]) => {
+  if (providers.length === 0) throw new Error(FallbackProviderError.NO_PROVIDER);
+
+  const networks = await Promise.all(providers.map(({ provider }) => provider.getNetwork().catch(() => null)));
+  const availableNetworks: Network[] = [];
+  const availableProviders: ProviderConfig[] = [];
+  networks.forEach((network, i) => {
+    if (!network) return;
+    availableNetworks.push(network);
+    availableProviders.push(providers[i]);
+  });
+
+  if (availableNetworks.length === 0) throw new Error(FallbackProviderError.CANNOT_DETECT_NETWORKS);
+
+  const defaultNetwork = availableNetworks[0];
+
+  if (availableNetworks.find((n) => n.chainId !== defaultNetwork.chainId))
+    throw new Error(FallbackProviderError.INCONSISTENT_NETWORKS);
+
+  return { network: defaultNetwork, providers: availableProviders };
+};
+
+export async function getBlockNumberWithTimeout(provider: JsonRpcApiProvider, timeout = 5000): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('Timeout'));
+    }, timeout);
+
+    provider
+      .getBlockNumber()
+      .then((blockNumber) => {
+        clearTimeout(timer);
+        resolve(blockNumber);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  }).catch((error) => {
+    throw error;
+  });
+}
+
+export async function getBlockNumber(providerConfig: ProviderConfig): Promise<number> {
+  let attempts = 0;
+
+  const retries = providerConfig.retries ?? DEFAULT_RETRIES;
+  const retryDelay = providerConfig.retryDelay ?? RETRY_DELAY;
+  const timeout = providerConfig.timeout ?? DEFAULT_TIMEOUT;
+
+  while (attempts <= retries) {
+    try {
+      const blockNumber = await getBlockNumberWithTimeout(providerConfig.provider, timeout);
+
+      return blockNumber;
+    } catch (e) {
+      if (++attempts > retries) {
+        throw e;
+      }
+    }
+
+    const delay = Math.ceil(Math.random() * (retryDelay ?? RETRY_DELAY));
+    await wait(delay);
+  }
+
+  throw new Error(FallbackProviderError.FAILED_TO_GET_BLOCKNUMBER);
+}
+
+export const getBlockNumbersAndMedian = async (providers: ProviderConfig[], logging?: LoggingOptions) => {
+  const blockNumbers = await Promise.all(
+    providers.map((provider) => {
+      const getProviderPromise = () =>
+        getBlockNumber(provider)
+          .then((blockNumber) => {
+            return { blockNumber: blockNumber, fromCache: false };
+          })
+          .catch(() => null);
+
+      if (provider.getStoredBlockNumber) {
+        return provider
+          .getStoredBlockNumber()
+          .then((blockNumber) => {
+            if (blockNumber === null) {
+              return getProviderPromise();
+            }
+
+            return { blockNumber, fromCache: true };
+          })
+          .catch((e) => {
+            logging?.warn?.(`[FallbackProvider] Error getting stored block number: ${e.message}`, {
+              error: e,
+            });
+
+            return getProviderPromise();
+          });
+      }
+
+      return getProviderPromise();
+    })
+  );
+
+  // Filter out the undefined block numbers.
+  const filteredBlockNumbers = blockNumbers
+    .filter((blockNumberCall) => blockNumberCall != null)
+    .map((blockNumberCall) => blockNumberCall!.blockNumber) as number[];
+  if (filteredBlockNumbers.length === 0) {
+    throw new Error(FallbackProviderError.ALL_PROVIDERS_UNAVAILABLE);
+  }
+
+  // Sort the valid block numbers.
+  const sortedBlockNumbers = filteredBlockNumbers.sort((a, b) => a - b);
+  // Calculate the median, computing the middle value if the length is odd.
+  let median: number;
+  if (sortedBlockNumbers.length % 2 === 0) {
+    const middle = sortedBlockNumbers.length / 2;
+    median = (sortedBlockNumbers[middle - 1] + sortedBlockNumbers[middle]) / 2;
+  } else {
+    median = sortedBlockNumbers[Math.floor(sortedBlockNumbers.length / 2)];
+  }
+
+  // Median should be an integer. Round down if it's not.
+  median = Math.floor(median);
+
+  return { blockNumbers: blockNumbers, median: median };
+};
+
+/**
+ * Full-featured RPC fallback provider for ethers v6, ported from
+ * `ethers-v6-fallback-provider`.
+ *
+ * Features: per-provider retries/timeouts, provider failover, liveliness
+ * polling with median block-number lag filtering, chain halt detection,
+ * JSON-RPC method capability filtering, transaction broadcast to all /
+ * MEV-protected-only providers, and blockchain-vs-transport error
+ * classification (blockchain errors are never retried on another RPC).
+ */
+export class FallbackProvider extends JsonRpcApiProvider {
+  #providers: ProviderConfig[];
+  #logging: LoggingOptions;
+  #fallbackOptions: FallbackProviderOptions;
+
+  #active = false;
+  #destroyed = false;
+  #halted = false;
+  #activeProviders: ProviderConfig[] = [];
+  #hasCapabilityConfig: boolean;
+
+  #latestBlockDiscovery: {
+    blockNumber: number | null;
+    time: number;
+  } = {
+    blockNumber: null,
+    time: 0,
+  };
+
+  constructor(
+    providers: ProviderConfig[],
+    network?: Networkish,
+    options?: JsonRpcApiProviderOptions,
+    loggingOptions?: LoggingOptions,
+    fallbackOptions?: FallbackProviderOptions
+  ) {
+    super(network, options);
+
+    this._validateFallbackOptions(fallbackOptions);
+
+    this.#activeProviders = this.#providers = providers;
+    this.#logging = loggingOptions ?? {};
+    this.#fallbackOptions = fallbackOptions ?? {};
+
+    // Add IDs to the providers if they don't have them.
+    this.#providers.forEach((provider, i) => {
+      if (!provider.id) {
+        provider.id = `${i}`;
+      }
+    });
+
+    this.#hasCapabilityConfig = this.#providers.some(
+      (provider) => provider.supportedMethods !== undefined || provider.unsupportedMethods !== undefined
+    );
+
+    this._start();
+  }
+
+  public activeProvidersCount(): number {
+    return this.#activeProviders.length;
+  }
+
+  public activeProviderIds(): string[] {
+    return this.#activeProviders.map((p) => p.id!);
+  }
+
+  public isHalted(): boolean {
+    return this.#halted;
+  }
+
+  /** Runs the liveliness check on demand (also runs automatically when polling is enabled). */
+  public async refreshLiveliness(): Promise<void> {
+    await this._livelinessCheck();
+  }
+
+  private _validateFallbackOptions(options: FallbackProviderOptions | undefined) {
+    if (!options) {
+      // No options provided. Using the default options.
+      return;
+    }
+
+    if (options.allowableBlockLag !== undefined && options.allowableBlockLag < 0) {
+      throw new Error(FallbackProviderError.INVALID_FALLBACK_OPTIONS);
+    }
+
+    if (options.haltDetectionTime !== undefined && options.haltDetectionTime < 0) {
+      throw new Error(FallbackProviderError.INVALID_FALLBACK_OPTIONS);
+    }
+
+    if (options.livelinessPollingInterval !== undefined && options.livelinessPollingInterval < 0) {
+      throw new Error(FallbackProviderError.INVALID_FALLBACK_OPTIONS);
+    }
+
+    if (options.getBlockDiscoveryTime && !options.setBlockDiscoveryTime) {
+      throw new Error(FallbackProviderError.BLOCK_NUMBER_STORAGE_CONFIG_ERROR);
+    }
+
+    if (!options.getBlockDiscoveryTime && options.setBlockDiscoveryTime) {
+      throw new Error(FallbackProviderError.BLOCK_NUMBER_STORAGE_CONFIG_ERROR);
+    }
+  }
+
+  private async sendWithProvider(
+    providers: ProviderConfig[],
+    providerIndex: number,
+    method: string,
+    params: { [name: string]: any },
+    promises: Promise<any>[] = new Array(),
+    retries = 0,
+    useFallback = true
+  ): Promise<any> {
+    if (promises.length > 0) {
+      // Check if any of the past promises have successfully resolved. If so, return the first one.
+      const resolvedValue = await checkAnyResolved(promises);
+      if (resolvedValue != null) {
+        return resolvedValue;
+      }
+    }
+
+    const { provider, retries: maxRetries, timeout, retryDelay, id } = providers[providerIndex];
+
+    const nextProviderId = providerIndex < providers.length - 1 ? providers[providerIndex + 1].id : null;
+
+    try {
+      if (isWebSocketProvider(provider)) {
+        // Provider is a WebSocketProvider. Let's perform some additional checks.
+        const readyState = (provider as WebSocketProvider).websocket.readyState;
+
+        if (readyState >= 2) {
+          // Closing or closed. Immediately fallback if possible.
+          this.#logging?.warn?.(`[FallbackProvider] Provider ${id} websocket closed`);
+
+          if (providerIndex >= providers.length - 1) {
+            throw new Error(`[FallbackProvider] Provider ${id} websocket closed with no fallback available`);
+          }
+
+          // We have another provider to fallback to.
+          return this.sendWithProvider(providers, providerIndex + 1, method, params, promises);
+        }
+
+        if (readyState !== 1) {
+          // Websocket still connecting. Fallback if possible.
+          if (providerIndex < providers.length - 1) {
+            this.#logging?.warn?.(
+              `[FallbackProvider] Provider ${id} websocket not ready. Fallbacking to provider ${nextProviderId}`
+            );
+
+            try {
+              return await this.sendWithProvider(providers, providerIndex + 1, method, params, promises);
+            } catch (e2: any) {
+              this.#logging?.warn?.(`[FallbackProvider] Fallback failed: ${e2.message}`, {
+                error: e2,
+              });
+            }
+          }
+
+          // If we're here, we failed to fallback and we know the websocket is not closed. Let's try sending the request
+          // to it below.
+
+          // We already tried to fallback, let's not do it again.
+          useFallback = false;
+        }
+      }
+
+      const providerPromise = provider.send(method, params).catch((e: any) => {
+        if (isAlreadyKnownError(e)) {
+          let txHash: string | undefined;
+          if (method === 'eth_sendRawTransaction' && Array.isArray(params) && typeof params[0] === 'string') {
+            try {
+              txHash = keccak256(params[0]); // raw tx hash
+            } catch (hashErr) {
+              this.#logging?.warn?.('[FallbackProvider] Failed to compute tx hash from raw tx', {
+                rawTx: params[0],
+                error: hashErr,
+              });
+            }
+          }
+
+          if (txHash) {
+            const broadcastToAll = this.#fallbackOptions.broadcastToAll ?? DEFAULT_FALLBACK_OPTIONS.broadcastToAll;
+            if (!broadcastToAll)
+              // Only log if we're not broadcasting to all providers. If we are, we expect this to happen commonly.
+              this.#logging?.warn?.(
+                `[FallbackProvider] Transaction already known, returning tx hash: ${txHash}`,
+                {
+                  transactionHash: txHash,
+                }
+              );
+
+            // Simulate successful eth_sendRawTransaction call
+            return txHash;
+          }
+        }
+
+        throw e;
+      });
+
+      // Add the promise to the list of promises.
+      promises.push(providerPromise);
+
+      return await withTimeout(providerPromise, timeout ?? DEFAULT_TIMEOUT);
+    } catch (e: any) {
+      // Check if any of the past promises have successfully resolved. If so, return the first one.
+      // It can be the case that a prior promise resolved after the current promise failed, such as when a transaction
+      // is mined, then this call fails to send a transaction because the nonce has already been used.
+      // This check reduces the likeliness of that happening.
+      const resolvedValue = await checkAnyResolved(promises);
+      if (resolvedValue != null) {
+        return resolvedValue;
+      }
+
+      if (this.#fallbackOptions.throwOnFirstBlockchainError ?? DEFAULT_FALLBACK_OPTIONS.throwOnFirstBlockchainError) {
+        if (promises.length === 1) {
+          // If we only have one promise, we can check and throw the error immediately.
+          if (isBlockchainError(e)) {
+            throw e;
+          }
+        } else {
+          const allRejected = await checkAllRejected(promises);
+
+          if (allRejected) {
+            for (const rejected of allRejected) {
+              if (isBlockchainError(rejected)) {
+                throw rejected;
+              }
+            }
+          }
+        }
+      }
+
+      if (retries < (maxRetries ?? DEFAULT_RETRIES)) {
+        // Wait for a random time before retrying.
+        const delay = Math.ceil(Math.random() * (retryDelay ?? RETRY_DELAY));
+        if (delay > 0) {
+          this.#logging?.debug?.(
+            `[FallbackProvider] Call to \`${method}\` failing with provider ${id}, retrying in ${delay}ms (${
+              retries + 1
+            }/${maxRetries}): ${e.message}`,
+            {
+              error: e,
+            }
+          );
+          await wait(delay);
+        }
+
+        return this.sendWithProvider(providers, providerIndex, method, params, promises, retries + 1, useFallback);
+      }
+      if (providerIndex >= providers.length - 1 || !useFallback) {
+        // No more retries or provides left to try. We've already checked pending promises so we can throw the error.
+
+        throw e;
+      }
+
+      this.#logging?.warn?.(
+        `[FallbackProvider] Call to \`${method}\` failing with provider ${id}, retrying with provider ${
+          nextProviderId
+        }: ${e.message}`,
+        {
+          error: e,
+        }
+      );
+      return this.sendWithProvider(providers, providerIndex + 1, method, params, promises);
+    }
+  }
+
+  async send(method: string, params: { [name: string]: any }): Promise<any> {
+    if (this.#destroyed) {
+      throw new Error(FallbackProviderError.DESTROYED);
+    }
+    if (this.#halted) {
+      throw new Error(FallbackProviderError.HALTED);
+    }
+
+    let providersToUse = this.#activeProviders;
+    if (providersToUse.length === 0) {
+      throw new Error(FallbackProviderError.ALL_PROVIDERS_UNAVAILABLE);
+    }
+
+    if (this.#hasCapabilityConfig) {
+      const capableProviders = filterProvidersByMethod(providersToUse, method);
+      if (capableProviders.length === 0) {
+        this.#logging?.warn?.(
+          `[FallbackProvider] No provider supports the \`${method}\` method: ${providersToUse
+            .map((p) => p.id)
+            .join(', ')}`
+        );
+
+        const error: any = new Error(FallbackProviderError.ALL_PROVIDERS_UNAVAILABLE);
+        error.providerIds = providersToUse.map((p) => p.id);
+        error.unsupportedMethod = method;
+
+        throw error;
+      } else if (capableProviders.length !== providersToUse.length) {
+        this.#logging?.debug?.(
+          `[FallbackProvider] Skipping providers that do not support the \`${method}\` method: ${providersToUse
+            .filter((p) => !capableProviders.includes(p))
+            .map((p) => p.id)
+            .join(', ')}`
+        );
+      }
+
+      providersToUse = capableProviders;
+    }
+
+    if (method === 'eth_chainId') {
+      return (await filterValidProviders(providersToUse)).network.chainId;
+    } else if (method === 'eth_sendRawTransaction') {
+      // Check if we should only broadcast to MEV-protected providers.
+      const broadcastOnlyToMevProtected =
+        this.#fallbackOptions.broadcastOnlyToMevProtected ?? DEFAULT_FALLBACK_OPTIONS.broadcastOnlyToMevProtected;
+      if (broadcastOnlyToMevProtected) {
+        // Filter out the MEV-protected providers.
+        providersToUse = providersToUse.filter((provider) => provider.isMevProtected);
+        if (providersToUse.length === 0) {
+          throw new Error(FallbackProviderError.ALL_PROVIDERS_UNAVAILABLE);
+        }
+      }
+
+      // Check if we should broadcast to all providers.
+      const broadcastToAll = this.#fallbackOptions.broadcastToAll ?? DEFAULT_FALLBACK_OPTIONS.broadcastToAll;
+      if (broadcastToAll) {
+        // Broadcast to all providers.
+        const providerPromises = new Array();
+
+        const delay =
+          this.#fallbackOptions.broadcastToAllConfig?.delay ??
+          DEFAULT_FALLBACK_BROADCAST_CONFIG.delay;
+        const delayJitter =
+          this.#fallbackOptions.broadcastToAllConfig?.delayJitter ??
+          DEFAULT_FALLBACK_BROADCAST_CONFIG.delayJitter;
+
+        const promises = providersToUse.map((provider, index) =>
+          (index > 0 && delay > 0
+            ? wait(delay + Math.round(Math.random() * delayJitter))
+            : Promise.resolve()
+          ).then(() =>
+            this.sendWithProvider([provider], 0, method, params, providerPromises).catch((e) => {
+              // Attach the list of provider IDs to the error.
+              e.providerIds = providersToUse.map((p) => p.id);
+
+              throw e;
+            })
+          )
+        );
+
+        try {
+          // Wait for the first result.
+          const result = await Promise.any(promises);
+
+          return result;
+        } catch (error: any) {
+          // If all promises throw errors, it should throw the first error.
+          throw error.errors[0];
+        }
+      }
+    }
+
+    return this.sendWithProvider(providersToUse, 0, method, params).catch((e) => {
+      // Attach the list of provider IDs to the error.
+      e.providerIds = providersToUse.map((p) => p.id);
+
+      throw e;
+    });
+  }
+
+  async _send(
+    payload: JsonRpcPayload | Array<JsonRpcPayload>
+  ): Promise<Array<JsonRpcResult | JsonRpcError>> {
+    throw new Error('Method not implemented.');
+  }
+
+  async _detectNetwork(): Promise<Network> {
+    for (const { provider } of this.#providers) {
+      try {
+        return await provider.getNetwork();
+      } catch {
+        // try the next provider
+      }
+    }
+    throw new Error(FallbackProviderError.CANNOT_DETECT_NETWORKS);
+  }
+
+  /**
+   * Gets the time at which a block was first discovered.
+   */
+  private async _getBlockDiscoveryTime(blockNumber: number): Promise<number | null> {
+    if (this.#fallbackOptions.getBlockDiscoveryTime) {
+      return this.#fallbackOptions.getBlockDiscoveryTime(blockNumber);
+    }
+
+    const latest = this.#latestBlockDiscovery;
+    if (latest.blockNumber === null) {
+      return null;
+    }
+
+    if (blockNumber <= latest.blockNumber) {
+      return latest.time;
+    }
+
+    return null;
+  }
+
+  /**
+   * Sets the time at which a block was first discovered.
+   */
+  private async _setBlockDiscoveryTime(blockNumber: number, currentTime: number | null): Promise<void> {
+    if (this.#fallbackOptions.setBlockDiscoveryTime) {
+      return this.#fallbackOptions.setBlockDiscoveryTime(blockNumber, currentTime);
+    }
+
+    const latest = this.#latestBlockDiscovery;
+    if (currentTime === null) {
+      this.#latestBlockDiscovery = {
+        blockNumber: null,
+        time: 0,
+      };
+
+      return;
+    }
+
+    if (latest.blockNumber !== null) {
+      // We have a latest block to check against.
+      if (blockNumber <= latest.blockNumber) {
+        // We don't update the discovery time if the block is not new.
+        return;
+      }
+    }
+
+    this.#latestBlockDiscovery = {
+      blockNumber: blockNumber,
+      time: currentTime,
+    };
+  }
+
+  private async _livelinessCheck() {
+    const providersToCheck = this.#providers;
+    const lastActiveProviders = this.#activeProviders;
+    const activeProviderIds = lastActiveProviders.map((p) => p.id);
+
+    let goodProviders: ProviderConfig[] = [];
+
+    try {
+      // Get the block numbers and the median.
+      const { blockNumbers, median } = await getBlockNumbersAndMedian(providersToCheck, this.#logging);
+
+      // Get the current time, in UNIX epoch time.
+      const currentTime = Math.floor(Date.now() / 1000);
+
+      // Filter the providers that are not too far behind the median.
+      const allowableBlockLag =
+        this.#fallbackOptions.allowableBlockLag ?? DEFAULT_FALLBACK_OPTIONS.allowableBlockLag;
+      const minBlockNumber = median - allowableBlockLag!;
+
+      for (let i = 0; i < blockNumbers.length; i++) {
+        const blockNumberCall = blockNumbers[i];
+        if (blockNumberCall === null) {
+          continue;
+        }
+
+        if (!blockNumberCall.fromCache) {
+          try {
+            await providersToCheck[i].setStoredBlockNumber?.(blockNumberCall.blockNumber);
+          } catch (e: any) {
+            this.#logging?.warn?.(`[FallbackProvider] Error setting stored block number: ${e.message}`, {
+              error: e,
+            });
+          }
+        }
+
+        if (blockNumberCall.blockNumber >= minBlockNumber) {
+          goodProviders.push(providersToCheck[i]);
+        }
+      }
+
+      let providerListChanged = false;
+
+      // Log added providers
+      const addedProviders = goodProviders.filter((p) => !activeProviderIds.includes(p.id));
+      addedProviders.forEach((p) => {
+        providerListChanged = true;
+
+        this.#logging?.info?.(`[FallbackProvider] Provider ${p.id} is now active`);
+      });
+
+      // Log removed providers
+      const removedProviders = lastActiveProviders.filter((p) => !goodProviders.includes(p));
+      removedProviders.forEach((p) => {
+        providerListChanged = true;
+
+        this.#logging?.info?.(`[FallbackProvider] Provider ${p.id} is now inactive`);
+      });
+
+      if (providerListChanged) {
+        this.#logging?.notice?.(
+          `[FallbackProvider] Active providers is now: ${goodProviders.map((p) => p.id).join(', ')}`
+        );
+      }
+
+      this.#activeProviders = goodProviders;
+
+      // We've filtered the providers by allowable block lag. Now let's check if the chain has halted.
+      const blockDiscoveryTime = await this._getBlockDiscoveryTime(median);
+      if (blockDiscoveryTime === null) {
+        // The block is new. We'll set the block discovery time.
+        await this._setBlockDiscoveryTime(median, currentTime);
+
+        this.#halted = false;
+      } else {
+        // The block is not new. Let's check if the chain has halted.
+        const haltDetectionTime =
+          this.#fallbackOptions.haltDetectionTime ?? DEFAULT_FALLBACK_OPTIONS.haltDetectionTime;
+
+        if (haltDetectionTime! > 0) {
+          if (currentTime - blockDiscoveryTime > haltDetectionTime!) {
+            // The chain has halted.
+            this.#halted = true;
+          } else {
+            this.#halted = false;
+          }
+        } else {
+          // Halt detection is disabled.
+          this.#halted = false;
+        }
+      }
+    } catch (e: any) {
+      this.#logging?.error?.(`[FallbackProvider] Liveliness check failed: ${e.message}`, {
+        error: e,
+      });
+
+      if (e.message === FallbackProviderError.ALL_PROVIDERS_UNAVAILABLE) {
+        this.#activeProviders = [];
+      }
+    }
+  }
+
+  _start(): void {
+    if (this.#destroyed) {
+      throw new Error(FallbackProviderError.DESTROYED);
+    }
+
+    if (!this.#active) {
+      this.#active = true;
+
+      const pollingInterval =
+        this.#fallbackOptions.livelinessPollingInterval ?? DEFAULT_FALLBACK_OPTIONS.livelinessPollingInterval;
+      if (pollingInterval! > 0) {
+        // Liveliness checks are enabled. Start the interval.
+        const intervalId = setInterval(async () => {
+          if (!this.#active) {
+            clearInterval(intervalId); // Stop the interval if #active is false
+
+            return;
+          }
+
+          await this._livelinessCheck(); // Call the async function
+        }, pollingInterval);
+      }
+    }
+
+    super._start();
+  }
+
+  destroy(): void {
+    this.#destroyed = true;
+    this.#active = false;
+    super.destroy();
+
+    // Try and destroy all providers.
+    this.#providers.forEach(({ provider }) => {
+      try {
+        provider.destroy();
+      } catch (e: any) {
+        this.#logging?.error?.(`[FallbackProvider] Error destroying provider: ${e.message}`, {
+          error: e,
+        });
+      }
+    });
+  }
+}
+
+function isWebSocketProvider(provider: any): boolean {
+  return !!provider.websocket;
+}

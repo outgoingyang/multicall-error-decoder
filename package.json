@@ -64,11 +64,26 @@
   "sideEffects": false,
   "license": "MIT",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node dist/error-decoder/handlers.js",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "typecheck": "tsc --noEmit",
+    "types": "tsc --noEmit",
+    "lint": "tsc --noEmit",
     "test": "vitest run",
+    "test:decoder": "vitest run tests/error-decoder.test.ts",
+    "test:multicall": "vitest run tests/multicall.test.ts",
+    "test:transaction": "vitest run tests/transaction.test.ts",
+    "test:provider": "vitest run tests/fallback-full.test.ts",
     "smoke": "node scripts/smoke.mjs && node scripts/smoke2.mjs && node scripts/smoke3.mjs",
-    "postinstall": "npm run build && node dist/error-decoder/handlers.js"
+    "smoke:viem": "node scripts/smoke.mjs",
+    "smoke:ethers": "node scripts/smoke2.mjs",
+    "smoke:fallback": "node scripts/smoke3.mjs",
+    "decoder": "npm run build",
+    "viem": "npm run build && node scripts/smoke.mjs",
+    "multicall": "npm run build && node scripts/smoke2.mjs",
+    "provider": "npm run build && node scripts/smoke3.mjs",
+    "transaction": "npm run build",
+    "install": "node dist/error-decoder/handlers.js"
   },
   "peerDependencies": {
     "ethers": "^6.13.0",

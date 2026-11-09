@@ -164,7 +164,7 @@ const client = createViemFallbackClient({
 ## Installation
 
 ```bash
-npm install multicall-error-decoder ethers viem
+npm install github:outgoingyang/multicall-error-decoder ethers viem
 ```
 
 `ethers` (v6) is a required peer dependency because the decoder and multicall use its ABI engine. `viem` is required too: the package targets both stacks by design.
